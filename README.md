@@ -11,12 +11,18 @@ http://nlp.seas.harvard.edu/annotated-transformer/
 
 # Package Dependencies
 
-Use `requirements.txt` to install library dependencies with pip:
+Install the dependencies with [uv](https://docs.astral.sh/uv/). This creates
+the virtual environment using Python 3.9 and the versions in `uv.lock`:
 
-```
-pip install -r requirements.txt
+```sh
+uv sync
+source .venv/bin/activate
 ```
 
+The dependencies include the CUDA 11.3 build of PyTorch 1.11, whose wheels
+support Linux x86-64 and Windows x86-64. A compatible NVIDIA GPU and driver
+are needed to use CUDA; CPU execution is also supported. The `pyproject.toml`
+file is the source of dependencies for `uv sync`.
 
 # Notebook Setup
 

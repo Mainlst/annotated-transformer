@@ -37,4 +37,4 @@ move-dataset:
 	cp 2016-01.tgz ~/.torchtext/cache/IWSLT2016/.
 
 setup: move-dataset
-	pip install -r requirements.txt
+	uv sync
