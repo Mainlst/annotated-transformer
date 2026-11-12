@@ -10,14 +10,27 @@ http://nlp.seas.harvard.edu/annotated-transformer/
 
 # パッケージの依存関係
 
-[uv](https://docs.astral.sh/uv/) で依存パッケージをインストールします。Python 3.9と `uv.lock` に記載されたバージョンを使う仮想環境が作成されます。
+[uv](https://docs.astral.sh/uv/) で依存パッケージをインストールします。Python 3.15と `uv.lock` に記載されたバージョンを使う仮想環境が作成されます。
 
 ```sh
 uv sync
 source .venv/bin/activate
 ```
 
-依存パッケージには、CUDA 11.3向けにビルドされたPyTorch 1.11が含まれます。そのホイールはLinux x86-64とWindows x86-64に対応しています。CUDAを使うには対応するNVIDIA GPUとドライバーが必要です。CPUでの実行にも対応しています。`uv sync` は `pyproject.toml` に定義された依存関係を使います。
+依存パッケージにはPyTorch 2.15が含まれます。Linux x86-64向けパッケージにはCUDA 13.2ライブラリが含まれ、CUDAの使用には対応するNVIDIA GPUとドライバーが必要です。CPUでも実行できます。`uv sync` は `pyproject.toml` に定義された依存関係を使います。開発が終了したtorchtextの語彙処理はローカル実装に置き換え、既存の語彙キャッシュは新形式で作り直します。
+
+# ノートブックの実行
+
+`uv run jupyter notebook` でJupyterを起動し、`AnnotatedTransformer.ipynb` または `AnnotatedTransformer.ja.ipynb` を開いて、セルを順番に実行します。初回は独英対訳データセットMulti30kを `.data/multi30k` にダウンロードし、次回以降はキャッシュを利用します。トークン化にはspaCyの組み込みトークナイザを使うため、学習済みのspaCyモデルは不要です。
+
+デフォルトでは、CPUとGPUのどちらでも試せる軽量なデモとして、小さなモデルを64文対で1エポック学習します。翻訳結果は処理の流れを示すためのもので、論文の結果とは比較できません。元の大きなモデルとデータセット全体で8エポック学習する場合は、Jupyterの起動前にモードを指定します。
+
+```sh
+ANNOTATED_TRANSFORMER_MODE=full uv run jupyter notebook
+```
+
+完全な学習には大幅に多くの時間とメモリが必要で、CUDA対応GPUを推奨します。設定が異なるチェックポイントは別々に保存されます。
+GPUが利用可能な環境でもCPUを使う場合は、`ANNOTATED_TRANSFORMER_DEVICE=cpu uv run jupyter notebook` でJupyterを起動してください。
 
 # ノートブックのセットアップ
 
@@ -47,7 +60,7 @@ make html
 
 # フォーマットと静的解析
 
-コードの書式を整えるため、このリポジトリではコードが [PEP 8のコーディング規約](https://www.python.org/dev/peps/pep-0008/) に準拠しているかをGitHub Actionsで確認しています。
+GitHub ActionsではPythonのエラーとオフラインのワークフローテストを確認しています。次のコマンドで [PEP 8のコーディング規約](https://peps.python.org/pep-0008/) に沿った書式の確認もできます。
 
 これを手軽に実行できるように、blackとflake8を使う2つの `Makefile` ターゲットが用意されています。[black](https://github.com/psf/black#installation) と [flake8](https://flake8.pycqa.org/en/latest/) がインストールされていることを確認してください。
 
@@ -67,4 +80,4 @@ make flake
 
 または、`flake8 --show-source the_annotated_transformer.py` を直接実行します。
 
-プルリクエストを提出する際は、GitHub ActionsのCIでエラーにならないよう、両方のコマンドを実行してflake8のエラーを修正することを推奨します。
+プルリクエストの提出前には、`uv run python -m unittest discover -s tests -v` で学習ワークフローのテストを実行してください。
