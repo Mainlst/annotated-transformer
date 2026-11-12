@@ -1,5 +1,7 @@
 Code for The Annotated Transformer blog post:
 
+[日本語版 README](README.ja.md) · [日本語版ノートブック](AnnotatedTransformer.ja.ipynb)
+
 http://nlp.seas.harvard.edu/annotated-transformer/
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/harvardnlp/annotated-transformer/blob/master/AnnotatedTransformer.ipynb)
