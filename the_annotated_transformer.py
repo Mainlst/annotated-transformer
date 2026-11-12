@@ -96,19 +96,23 @@
 # <a href="#background">Skip</a>
 
 # %% id="NwClcbH6Tsp8"
-# # !pip install -r requirements.txt
+# # Install the project dependencies with: uv sync
 
 # %% id="NwClcbH6Tsp8"
-# # Uncomment for colab
-# #
-# # !pip install -q torchdata==0.3.0 torchtext==0.12 spacy==3.2 altair GPUtil
-# # !python -m spacy download de_core_news_sm
-# # !python -m spacy download en_core_web_sm
+# # Start Jupyter with: uv run jupyter notebook
 
 
 # %% id="v1-1MX6oTsp9"
 import os
 from os.path import exists
+from functools import lru_cache
+import gzip
+import itertools
+from pathlib import Path
+import tempfile
+import urllib.request
+import hashlib
+import json
 import torch
 import torch.nn as nn
 from torch.nn.functional import log_softmax, pad
@@ -118,10 +122,7 @@ import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
-from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
-from torchtext.vocab import build_vocab_from_iterator
-import torchtext.datasets as datasets
 import spacy
 import GPUtil
 import warnings
@@ -954,31 +955,50 @@ def run_epoch(
     scheduler,
     mode="train",
     accum_iter=1,
-    train_state=TrainState(),
+    train_state=None,
 ):
     """Train a single epoch"""
+    if accum_iter < 1:
+        raise ValueError("accum_iter must be at least 1")
+    if train_state is None:
+        train_state = TrainState()
     start = time.time()
     total_tokens = 0
     total_loss = 0
     tokens = 0
     n_accum = 0
+    pending = 0
+    training = mode in ("train", "train+log")
+
+    def optimizer_step(count):
+        # Average the gradients of all batches in this accumulation window,
+        # including a shorter final window.
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(count)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+        train_state.accum_step += 1
+
+    if training:
+        optimizer.zero_grad(set_to_none=True)
     for i, batch in enumerate(data_iter):
-        out = model.forward(
-            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask
-        )
-        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
-        # loss_node = loss_node / accum_iter
-        if mode == "train" or mode == "train+log":
+        with torch.set_grad_enabled(training):
+            out = model.forward(
+                batch.src, batch.tgt, batch.src_mask, batch.tgt_mask
+            )
+            loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
+        if training:
             loss_node.backward()
             train_state.step += 1
             train_state.samples += batch.src.shape[0]
             train_state.tokens += batch.ntokens
-            if i % accum_iter == 0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            pending += 1
+            if pending == accum_iter:
+                optimizer_step(pending)
                 n_accum += 1
-                train_state.accum_step += 1
-            scheduler.step()
+                pending = 0
 
         total_loss += loss
         total_tokens += batch.ntokens
@@ -997,6 +1017,10 @@ def run_epoch(
             tokens = 0
         del loss
         del loss_node
+    if training and pending:
+        optimizer_step(pending)
+    if not total_tokens:
+        raise ValueError("The data iterator contained no target tokens")
     return total_loss / total_tokens, train_state
 
 
@@ -1119,7 +1143,7 @@ def example_learning_schedule():
         alt.Chart(opts_data)
         .mark_line()
         .properties(width=600)
-        .encode(x="step", y="Learning Rate", color="model_size:warmup:N")
+        .encode(x="step", y="Learning Rate", color=alt.Color(field="model_size:warmup", type="nominal"))
         .interactive()
     )
 
@@ -1310,7 +1334,7 @@ class SimpleLossCompute:
 # %% [markdown] id="LFkWakplTsqL" tags=[]
 # > This code predicts a translation using greedy decoding for simplicity.
 # %% id="N2UOpnT3bIyU"
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
+def greedy_decode(model, src, src_mask, max_len, start_symbol, eos_symbol=None):
     memory = model.encode(src, src_mask)
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
@@ -1323,6 +1347,8 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
         ys = torch.cat(
             [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
         )
+        if eos_symbol is not None and next_word.item() == eos_symbol:
+            break
     return ys
 
 
@@ -1384,102 +1410,222 @@ def example_simple_model():
 # > the WMT task considered in the paper, but it illustrates the whole
 # > system. We also show how to use multi-gpu processing to make it
 # > really fast.
+# > By default this notebook trains a small demonstration model on 64
+# > sentence pairs. Set ANNOTATED_TRANSFORMER_MODE=full before starting
+# > Jupyter to use the larger model and the complete training set.
 
 # %% [markdown] id="8y9dpfolTsqL" tags=[]
 # ## Data Loading
 #
-# > We will load the dataset using torchtext and spacy for
-# > tokenization.
+# > We load the dataset directly and use spaCy for tokenization.
 
 # %%
-# Load spacy tokenizer models, download them if they haven't been
-# downloaded already
+# Configure the run and load the Multi30k tokenizers and data.
+
+
+def training_config():
+    """Use a quick demonstration by default; opt into full training explicitly."""
+    mode = os.environ.get("ANNOTATED_TRANSFORMER_MODE", "demo").lower()
+    if mode not in ("demo", "full"):
+        raise ValueError("ANNOTATED_TRANSFORMER_MODE must be demo or full")
+    device = os.environ.get("ANNOTATED_TRANSFORMER_DEVICE", "auto").lower()
+    if device not in ("auto", "cpu", "cuda"):
+        raise ValueError("ANNOTATED_TRANSFORMER_DEVICE must be auto, cpu or cuda")
+    full = mode == "full"
+    return {
+        "mode": mode,
+        "device": device,
+        "model": {
+            "N": 6, "d_model": 512 if full else 64,
+            "d_ff": 2048 if full else 128, "h": 8, "dropout": 0.1,
+        },
+        "batch_size": 32 if full else 8,
+        "distributed": os.environ.get("ANNOTATED_TRANSFORMER_DISTRIBUTED") == "1",
+        "num_epochs": 8 if full else 1,
+        "accum_iter": 10 if full else 2,
+        "base_lr": 1.0 if full else 0.5,
+        "max_padding": 72 if full else 32,
+        "warmup": 3000 if full else 10,
+        "max_train_samples": None if full else 64,
+        "max_valid_samples": None if full else 8,
+        "file_prefix": f"multi30k_{mode}_",
+    }
+
+
+MULTI30K_REVISION = "a3d2e0d26b56f3846f66a952536ffed4e401d05a"
+MULTI30K_URL = (
+    "https://raw.githubusercontent.com/multi30k/dataset/"
+    + MULTI30K_REVISION + "/data/task1/raw/{name}.{language}.gz"
+)
+MULTI30K_DIR = Path(".data/multi30k")
+SPLITS = {"train": "train", "valid": "val", "test": "test_2016_flickr"}
+SPECIALS = ["<s>", "</s>", "<blank>", "<unk>"]
+
 
 
 def load_tokenizers():
+    """Only tokenization is needed; no pretrained spaCy model is required."""
+    return spacy.blank("de"), spacy.blank("en")
 
+
+def _cached_data_file(name, language, root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{name}.{language}.{MULTI30K_REVISION[:12]}.gz"
+    if path.exists():
+        return path
+    url = MULTI30K_URL.format(name=name, language=language)
+    # Download to a temporary file and only publish a complete gzip stream.
+    # It is safe for two notebook processes to populate this cache concurrently.
+    fd, temp_name = tempfile.mkstemp(prefix=".download-", suffix=".gz", dir=root)
     try:
-        spacy_de = spacy.load("de_core_news_sm")
-    except IOError:
-        os.system("python -m spacy download de_core_news_sm")
-        spacy_de = spacy.load("de_core_news_sm")
+        with os.fdopen(fd, "wb") as out, urllib.request.urlopen(url, timeout=60) as response:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        with gzip.open(temp_name, "rb") as stream:
+            while stream.read(1024 * 1024):
+                pass
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return path
 
-    try:
-        spacy_en = spacy.load("en_core_web_sm")
-    except IOError:
-        os.system("python -m spacy download en_core_web_sm")
-        spacy_en = spacy.load("en_core_web_sm")
 
-    return spacy_de, spacy_en
+def load_multi30k(split=None, limit=None, root=MULTI30K_DIR):
+    """Return aligned German/English sentence pairs for a split.
+
+    ``limit`` is deterministic (first N pairs), making a small CPU run possible.
+    Distinct train and validation limits do not change the underlying cache.
+    """
+    if split is None:
+        if limit is not None:
+            raise ValueError("A limit requires an explicit dataset split")
+        return tuple(load_multi30k(name, root=root) for name in ("train", "valid", "test"))
+    if split not in SPLITS:
+        raise ValueError(f"Unknown Multi30k split: {split!r}")
+    if limit is not None and limit < 1:
+        raise ValueError("The dataset limit must be positive or None")
+    name = SPLITS[split]
+    de_path = _cached_data_file(name, "de", root)
+    en_path = _cached_data_file(name, "en", root)
+    with gzip.open(de_path, "rt", encoding="utf-8") as de, gzip.open(en_path, "rt", encoding="utf-8") as en:
+        pairs = itertools.zip_longest(de, en)
+        # Read all data, even with a limit, to detect misaligned source files.
+        result = []
+        for idx, (src, tgt) in enumerate(pairs):
+            if src is None or tgt is None:
+                raise ValueError(f"Unaligned Multi30k {split!r} files")
+            if limit is None or idx < limit:
+                result.append((src.rstrip("\n"), tgt.rstrip("\n")))
+    if not result:
+        raise ValueError(f"Multi30k {split!r} split is empty")
+    return result
 
 
 # %% id="t4BszXXJTsqL" tags=[]
 def tokenize(text, tokenizer):
-    return [tok.text for tok in tokenizer.tokenizer(text)]
+    return [token.text for token in tokenizer.tokenizer(text)]
 
 
 def yield_tokens(data_iter, tokenizer, index):
-    for from_to_tuple in data_iter:
-        yield tokenizer(from_to_tuple[index])
+    for pair in data_iter:
+        yield tokenize(pair[index], tokenizer)
 
 
 # %% id="jU3kVlV5okC-" tags=[]
 
 
-def build_vocabulary(spacy_de, spacy_en):
-    def tokenize_de(text):
-        return tokenize(text, spacy_de)
+class Vocabulary:
+    """Token-to-index mapping with deterministic frequency ordering."""
 
-    def tokenize_en(text):
-        return tokenize(text, spacy_en)
+    def __init__(self, tokens):
+        self.tokens = list(tokens)
+        self.indices = {token: index for index, token in enumerate(self.tokens)}
+        self.unknown_index = self.indices["<unk>"]
 
-    print("Building German Vocabulary ...")
-    train, val, test = datasets.Multi30k(language_pair=("de", "en"))
-    vocab_src = build_vocab_from_iterator(
-        yield_tokens(train + val + test, tokenize_de, index=0),
-        min_freq=2,
-        specials=["<s>", "</s>", "<blank>", "<unk>"],
+    def __len__(self):
+        return len(self.tokens)
+
+    def __contains__(self, token):
+        return token in self.indices
+
+    def __getitem__(self, token):
+        return self.indices.get(token, self.unknown_index)
+
+    def __call__(self, tokens):
+        return [self[token] for token in tokens]
+
+    def get_itos(self):
+        return list(self.tokens)
+
+
+def build_vocab_from_iterator(iterator, min_freq, specials):
+    from collections import Counter
+
+    counts = Counter(token for tokens in iterator for token in tokens)
+    tokens = sorted(
+        (token for token, count in counts.items()
+         if count >= min_freq and token not in specials),
+        key=lambda token: (-counts[token], token),
     )
-
-    print("Building English Vocabulary ...")
-    train, val, test = datasets.Multi30k(language_pair=("de", "en"))
-    vocab_tgt = build_vocab_from_iterator(
-        yield_tokens(train + val + test, tokenize_en, index=1),
-        min_freq=2,
-        specials=["<s>", "</s>", "<blank>", "<unk>"],
-    )
-
-    vocab_src.set_default_index(vocab_src["<unk>"])
-    vocab_tgt.set_default_index(vocab_tgt["<unk>"])
-
-    return vocab_src, vocab_tgt
+    return Vocabulary(list(specials) + tokens)
 
 
-def load_vocab(spacy_de, spacy_en):
-    if not exists("vocab.pt"):
-        vocab_src, vocab_tgt = build_vocabulary(spacy_de, spacy_en)
-        torch.save((vocab_src, vocab_tgt), "vocab.pt")
+def build_vocabulary(spacy_de, spacy_en, train_limit=None, root=MULTI30K_DIR):
+    # Never expose validation/test sentences when building vocabularies.
+    train = load_multi30k("train", limit=train_limit, root=root)
+    vocabs = []
+    for index, tokenizer in enumerate((spacy_de, spacy_en)):
+        vocab = build_vocab_from_iterator(
+            yield_tokens(train, tokenizer, index), min_freq=2, specials=SPECIALS
+        )
+        vocabs.append(vocab)
+    return tuple(vocabs)
+
+
+def load_vocab(spacy_de, spacy_en, train_limit=None, root=MULTI30K_DIR):
+    """Cache vocabularies separately for each data subset and spaCy version."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    # Include tokenizer identity and language in cache key to avoid reusing a
+    # vocabulary produced by the original pretrained tokenizer or other corpus.
+    cache_key = f"{MULTI30K_REVISION}:{train_limit}:spacy-blank:{spacy.__version__}"
+    cache_id = hashlib.sha256(cache_key.encode()).hexdigest()[:16]
+    cache_path = root / f"vocab-{cache_id}-v2.json"
+    if cache_path.exists():
+        with cache_path.open(encoding="utf-8") as stream:
+            vocab_src, vocab_tgt = (Vocabulary(tokens) for tokens in json.load(stream))
     else:
-        vocab_src, vocab_tgt = torch.load("vocab.pt")
-    print("Finished.\nVocabulary sizes:")
-    print(len(vocab_src))
-    print(len(vocab_tgt))
+        vocab_src, vocab_tgt = build_vocabulary(
+            spacy_de, spacy_en, train_limit=train_limit, root=root
+        )
+        fd, temp_name = tempfile.mkstemp(prefix=".vocab-", suffix=".json", dir=root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump([vocab_src.get_itos(), vocab_tgt.get_itos()], stream)
+            os.replace(temp_name, cache_path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
     return vocab_src, vocab_tgt
 
 
-if is_interactive_notebook():
-    # global variables used later in the script
+if is_interactive_notebook() and RUN_EXAMPLES:
     spacy_de, spacy_en = show_example(load_tokenizers)
-    vocab_src, vocab_tgt = show_example(load_vocab, args=[spacy_de, spacy_en])
+    vocab_src, vocab_tgt = show_example(
+        load_vocab,
+        args=[spacy_de, spacy_en, training_config()["max_train_samples"]],
+    )
 
 
 # %% [markdown] id="-l-TFwzfTsqL"
 #
-# > Batching matters a ton for speed. We want to have very evenly
-# > divided batches, with absolutely minimal padding. To do this we
-# > have to hack a bit around the default torchtext batching. This
-# > code patches their default batching to make sure we search over
-# > enough sentences to find tight batches.
+# > Batching matters for speed. We use a PyTorch DataLoader with a custom
+# > collate function to tokenize, truncate, and pad each batch.
 
 # %% [markdown] id="kDEj-hCgokC-" tags=[] jp-MarkdownHeadingCollapsed=true
 # ## Iterators
@@ -1495,6 +1641,8 @@ def collate_batch(
     max_padding=128,
     pad_id=2,
 ):
+    if max_padding < 2:
+        raise ValueError("max_padding must leave space for start and end tokens")
     bs_id = torch.tensor([0], device=device)  # <s> token id
     eos_id = torch.tensor([1], device=device)  # </s> token id
     src_list, tgt_list = [], []
@@ -1503,7 +1651,7 @@ def collate_batch(
             [
                 bs_id,
                 torch.tensor(
-                    src_vocab(src_pipeline(_src)),
+                    src_vocab(src_pipeline(_src)[: max_padding - 2]),
                     dtype=torch.int64,
                     device=device,
                 ),
@@ -1515,7 +1663,7 @@ def collate_batch(
             [
                 bs_id,
                 torch.tensor(
-                    tgt_vocab(tgt_pipeline(_tgt)),
+                    tgt_vocab(tgt_pipeline(_tgt)[: max_padding - 2]),
                     dtype=torch.int64,
                     device=device,
                 ),
@@ -1524,7 +1672,6 @@ def collate_batch(
             0,
         )
         src_list.append(
-            # warning - overwrites values for negative values of padding - len
             pad(
                 processed_src,
                 (
@@ -1548,65 +1695,24 @@ def collate_batch(
 
 
 # %% id="ka2Ce_WIokC_" tags=[]
-def create_dataloaders(
-    device,
-    vocab_src,
-    vocab_tgt,
-    spacy_de,
-    spacy_en,
-    batch_size=12000,
-    max_padding=128,
-    is_distributed=True,
-):
-    # def create_dataloaders(batch_size=12000):
-    def tokenize_de(text):
-        return tokenize(text, spacy_de)
-
-    def tokenize_en(text):
-        return tokenize(text, spacy_en)
-
+def create_dataloaders(device, vocab_src, vocab_tgt, spacy_de, spacy_en,
+                       batch_size=32, max_padding=128, is_distributed=False,
+                       max_train_samples=None, max_valid_samples=None, root=MULTI30K_DIR):
     def collate_fn(batch):
         return collate_batch(
-            batch,
-            tokenize_de,
-            tokenize_en,
-            vocab_src,
-            vocab_tgt,
-            device,
-            max_padding=max_padding,
-            pad_id=vocab_src.get_stoi()["<blank>"],
+            batch, lambda text: tokenize(text, spacy_de),
+            lambda text: tokenize(text, spacy_en), vocab_src, vocab_tgt, device,
+            max_padding=max_padding, pad_id=vocab_src["<blank>"],
         )
-
-    train_iter, valid_iter, test_iter = datasets.Multi30k(
-        language_pair=("de", "en")
-    )
-
-    train_iter_map = to_map_style_dataset(
-        train_iter
-    )  # DistributedSampler needs a dataset len()
-    train_sampler = (
-        DistributedSampler(train_iter_map) if is_distributed else None
-    )
-    valid_iter_map = to_map_style_dataset(valid_iter)
-    valid_sampler = (
-        DistributedSampler(valid_iter_map) if is_distributed else None
-    )
-
-    train_dataloader = DataLoader(
-        train_iter_map,
-        batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        collate_fn=collate_fn,
-    )
-    valid_dataloader = DataLoader(
-        valid_iter_map,
-        batch_size=batch_size,
-        shuffle=(valid_sampler is None),
-        sampler=valid_sampler,
-        collate_fn=collate_fn,
-    )
-    return train_dataloader, valid_dataloader
+    train = load_multi30k("train", limit=max_train_samples, root=root)
+    valid = load_multi30k("valid", limit=max_valid_samples, root=root)
+    train_sampler = DistributedSampler(train) if is_distributed else None
+    valid_sampler = DistributedSampler(valid, shuffle=False) if is_distributed else None
+    train_loader = DataLoader(train, batch_size=batch_size, shuffle=train_sampler is None,
+                              sampler=train_sampler, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid, batch_size=batch_size, shuffle=False,
+                              sampler=valid_sampler, collate_fn=collate_fn)
+    return train_loader, valid_loader
 
 
 # %% [markdown] id="90qM8RzCTsqM"
@@ -1623,13 +1729,22 @@ def train_worker(
     config,
     is_distributed=False,
 ):
-    print(f"Train worker process using GPU: {gpu} for training", flush=True)
-    torch.cuda.set_device(gpu)
+    use_cuda = config["device"] != "cpu" and torch.cuda.is_available()
+    if config["device"] == "cuda" and not use_cuda:
+        raise RuntimeError("CUDA was requested but is not available")
+    if is_distributed and not use_cuda:
+        raise RuntimeError("Distributed training requires CUDA GPUs")
+    device = torch.device("cuda", gpu) if use_cuda else torch.device("cpu")
+    if use_cuda:
+        torch.cuda.set_device(device)
+    else:
+        # Excessive CPU threads make the small example much slower.
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+    print(f"Training on {device}", flush=True)
 
     pad_idx = vocab_tgt["<blank>"]
-    d_model = 512
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.cuda(gpu)
+    model = make_model(len(vocab_src), len(vocab_tgt), **config["model"])
+    model.to(device)
     module = model
     is_main_process = True
     if is_distributed:
@@ -1642,27 +1757,26 @@ def train_worker(
 
     criterion = LabelSmoothing(
         size=len(vocab_tgt), padding_idx=pad_idx, smoothing=0.1
-    )
-    criterion.cuda(gpu)
-
+    ).to(device)
     train_dataloader, valid_dataloader = create_dataloaders(
-        gpu,
+        device,
         vocab_src,
         vocab_tgt,
         spacy_de,
         spacy_en,
-        batch_size=config["batch_size"] // ngpus_per_node,
+        batch_size=max(1, config["batch_size"] // ngpus_per_node),
         max_padding=config["max_padding"],
         is_distributed=is_distributed,
+        max_train_samples=config["max_train_samples"],
+        max_valid_samples=config["max_valid_samples"],
     )
-
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9
     )
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
         lr_lambda=lambda step: rate(
-            step, d_model, factor=1, warmup=config["warmup"]
+            step, config["model"]["d_model"], factor=1, warmup=config["warmup"]
         ),
     )
     train_state = TrainState()
@@ -1673,7 +1787,7 @@ def train_worker(
             valid_dataloader.sampler.set_epoch(epoch)
 
         model.train()
-        print(f"[GPU{gpu}] Epoch {epoch} Training ====", flush=True)
+        print(f"[{device}] Epoch {epoch} Training ====", flush=True)
         _, train_state = run_epoch(
             (Batch(b[0], b[1], pad_idx) for b in train_dataloader),
             model,
@@ -1684,16 +1798,13 @@ def train_worker(
             accum_iter=config["accum_iter"],
             train_state=train_state,
         )
+        if use_cuda:
+            GPUtil.showUtilization()
+            torch.cuda.empty_cache()
 
-        GPUtil.showUtilization()
-        if is_main_process:
-            file_path = "%s%.2d.pt" % (config["file_prefix"], epoch)
-            torch.save(module.state_dict(), file_path)
-        torch.cuda.empty_cache()
-
-        print(f"[GPU{gpu}] Epoch {epoch} Validation ====", flush=True)
+        print(f"[{device}] Epoch {epoch} Validation ====", flush=True)
         model.eval()
-        sloss = run_epoch(
+        sloss, _ = run_epoch(
             (Batch(b[0], b[1], pad_idx) for b in valid_dataloader),
             model,
             SimpleLossCompute(module.generator, criterion),
@@ -1701,12 +1812,19 @@ def train_worker(
             DummyScheduler(),
             mode="eval",
         )
-        print(sloss)
-        torch.cuda.empty_cache()
+        print("Validation loss:", sloss)
 
     if is_main_process:
-        file_path = "%sfinal.pt" % config["file_prefix"]
-        torch.save(module.state_dict(), file_path)
+        torch.save(
+            {
+                "model_state_dict": module.state_dict(),
+                "model_config": config["model"],
+                "signature": config["signature"],
+            },
+            config["checkpoint_path"],
+        )
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 # %% tags=[]
@@ -1714,6 +1832,8 @@ def train_distributed_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
     from the_annotated_transformer import train_worker
 
     ngpus = torch.cuda.device_count()
+    if config["device"] == "cpu" or ngpus == 0:
+        raise RuntimeError("Distributed training requires CUDA GPUs")
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12356"
     print(f"Number of GPUs detected: {ngpus}")
@@ -1736,27 +1856,47 @@ def train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
         )
 
 
-def load_trained_model():
-    config = {
-        "batch_size": 32,
-        "distributed": False,
-        "num_epochs": 8,
-        "accum_iter": 10,
-        "base_lr": 1.0,
-        "max_padding": 72,
-        "warmup": 3000,
-        "file_prefix": "multi30k_model_",
+def checkpoint_config(config, vocab_src, vocab_tgt):
+    """Give checkpoints distinct names for each training setup and vocabulary."""
+    config = copy.deepcopy(config)
+    signature_input = {
+        "config": config,
+        "dataset_revision": MULTI30K_REVISION,
+        "tokenizer": f"spacy-blank-{spacy.__version__}",
+        "source_vocabulary": vocab_src.get_itos(),
+        "target_vocabulary": vocab_tgt.get_itos(),
     }
-    model_path = "multi30k_model_final.pt"
-    if not exists(model_path):
+    signature = hashlib.sha256(
+        json.dumps(signature_input, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    config["signature"] = signature
+    config["checkpoint_path"] = f'{config["file_prefix"]}{signature[:16]}.pt'
+    return config
+
+
+def load_trained_model():
+    config = checkpoint_config(training_config(), vocab_src, vocab_tgt)
+    print(
+        f'Training mode: {config["mode"]}; '
+        f'checkpoint: {config["checkpoint_path"]}'
+    )
+    if config["mode"] == "demo":
+        print("The demo uses a small model and dataset; translations are illustrative.")
+    if not exists(config["checkpoint_path"]):
+        torch.manual_seed(0)
         train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
 
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.load_state_dict(torch.load("multi30k_model_final.pt"))
+    checkpoint = torch.load(config["checkpoint_path"], map_location="cpu")
+    if (checkpoint.get("signature") != config["signature"] or
+            checkpoint.get("model_config") != config["model"]):
+        raise ValueError("Checkpoint does not match the current model and vocabulary")
+    model = make_model(len(vocab_src), len(vocab_tgt), **config["model"])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
     return model
 
 
-if is_interactive_notebook():
+if is_interactive_notebook() and RUN_EXAMPLES:
     model = load_trained_model()
 
 
@@ -1764,8 +1904,8 @@ if is_interactive_notebook():
 #
 # > Once trained we can decode the model to produce a set of
 # > translations. Here we simply translate the first sentence in the
-# > validation set. This dataset is pretty small so the translations
-# > with greedy search are reasonably accurate.
+# > validation set. The default small demonstration run is intended to
+# > illustrate the workflow, not to produce high-quality translations.
 
 # %% [markdown] id="L50i0iEXTsqN"
 # # Additional Components: BPE, Search, Averaging
@@ -1800,8 +1940,9 @@ if is_interactive_notebook():
 
 # %% id="tb3j3CYLTsqN" tags=[]
 if False:
-    model.src_embed[0].lut.weight = model.tgt_embeddings[0].lut.weight
-    model.generator.lut.weight = model.tgt_embed[0].lut.weight
+    # This requires a shared source/target vocabulary and token ordering.
+    model.src_embed[0].lut.weight = model.tgt_embed[0].lut.weight
+    model.generator.proj.weight = model.tgt_embed[0].lut.weight
 
 
 # %% [markdown] id="xDKJsSwRTsqN"
@@ -1820,9 +1961,16 @@ if False:
 
 # %% id="hAFEa78JokDB"
 def average(model, models):
-    "Average models into model"
-    for ps in zip(*[m.params() for m in [model] + models]):
-        ps[0].copy_(torch.sum(*ps[1:]) / len(ps[1:]))
+    "Average the parameters of models into model."
+    if not models:
+        raise ValueError("At least one source model is required")
+    target = list(model.parameters())
+    sources = [list(source.parameters()) for source in models]
+    if any(len(params) != len(target) for params in sources):
+        raise ValueError("All models must have the same architecture")
+    with torch.no_grad():
+        for output, params in zip(target, zip(*sources)):
+            output.copy_(torch.stack(params).mean(dim=0))
 
 
 # %% [markdown] id="Kz5BYJ9sTsqO"
@@ -1851,14 +1999,15 @@ def average(model, models):
 #
 #
 # > With the addtional extensions in the last section, the OpenNMT-py
-# > replication gets to 26.9 on EN-DE WMT. Here I have loaded in those
-# > parameters to our reimplemenation.
+# > replication gets to 26.9 on EN-DE WMT. The following visualizations
+# > use the model trained above, not those pretrained parameters.
 
 # %%
 # Load data and model for output checks
 
 
 # %%
+@torch.no_grad()
 def check_outputs(
     valid_dataloader,
     model,
@@ -1867,14 +2016,15 @@ def check_outputs(
     n_examples=15,
     pad_idx=2,
     eos_string="</s>",
+    max_len=72,
 ):
-    results = [()] * n_examples
-    for idx in range(n_examples):
+    results = []
+    model.eval()
+    for idx, b in enumerate(valid_dataloader):
+        if idx >= n_examples:
+            break
         print("\nExample %d ========\n" % idx)
-        b = next(iter(valid_dataloader))
         rb = Batch(b[0], b[1], pad_idx)
-        greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
-
         src_tokens = [
             vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx
         ]
@@ -1890,22 +2040,23 @@ def check_outputs(
             "Target Text (Ground Truth) : "
             + " ".join(tgt_tokens).replace("\n", "")
         )
-        model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0)[0]
-        model_txt = (
-            " ".join(
-                [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
-            ).split(eos_string, 1)[0]
-            + eos_string
-        )
+        model_out = greedy_decode(
+            model, rb.src, rb.src_mask, max_len, vocab_tgt["<s>"],
+            eos_symbol=vocab_tgt[eos_string],
+        )[0]
+        words = [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
+        model_txt = " ".join(words)
         print("Model Output               : " + model_txt.replace("\n", ""))
-        results[idx] = (rb, src_tokens, tgt_tokens, model_out, model_txt)
+        results.append((rb, src_tokens, tgt_tokens, model_out, model_txt))
     return results
 
 
+@lru_cache(maxsize=1)
 def run_model_example(n_examples=5):
-    global vocab_src, vocab_tgt, spacy_de, spacy_en
+    global vocab_src, vocab_tgt, spacy_de, spacy_en, model
 
     print("Preparing Data ...")
+    config = training_config()
     _, valid_dataloader = create_dataloaders(
         torch.device("cpu"),
         vocab_src,
@@ -1913,19 +2064,18 @@ def run_model_example(n_examples=5):
         spacy_de,
         spacy_en,
         batch_size=1,
+        max_padding=config["max_padding"],
         is_distributed=False,
+        max_train_samples=config["max_train_samples"],
+        max_valid_samples=config["max_valid_samples"],
     )
-
-    print("Loading Trained Model ...")
-
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
-    model.load_state_dict(
-        torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
-    )
-
+    model.to(torch.device("cpu"))
+    torch.set_num_threads(min(4, torch.get_num_threads()))
+    model.eval()
     print("Checking Model Outputs:")
     example_data = check_outputs(
-        valid_dataloader, model, vocab_src, vocab_tgt, n_examples=n_examples
+        valid_dataloader, model, vocab_src, vocab_tgt,
+        n_examples=n_examples, max_len=config["max_padding"],
     )
     return model, example_data
 
