@@ -1,5 +1,7 @@
 Code for The Annotated Transformer blog post:
 
+[日本語版 README](README.ja.md) · [日本語版ノートブック](AnnotatedTransformer.ja.ipynb)
+
 http://nlp.seas.harvard.edu/annotated-transformer/
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/harvardnlp/annotated-transformer/blob/master/AnnotatedTransformer.ipynb)
@@ -11,12 +13,44 @@ http://nlp.seas.harvard.edu/annotated-transformer/
 
 # Package Dependencies
 
-Use `requirements.txt` to install library dependencies with pip:
+Install the dependencies with [uv](https://docs.astral.sh/uv/). This creates
+the virtual environment using Python 3.15 and the versions in `uv.lock`:
 
-```
-pip install -r requirements.txt
+```sh
+uv sync
+source .venv/bin/activate
 ```
 
+The locked dependencies include PyTorch 2.15. On Linux x86-64, its default
+package includes CUDA 13.2 libraries; CUDA requires a compatible NVIDIA GPU
+and driver. CPU execution is also supported. `pyproject.toml` defines the
+dependencies used by `uv sync`. Vocabulary handling is implemented locally
+because torchtext is no longer maintained. Existing vocabulary caches are
+rebuilt in the new format.
+
+# Running the notebook
+
+Start Jupyter with `uv run jupyter notebook` and open either
+`AnnotatedTransformer.ipynb` or `AnnotatedTransformer.ja.ipynb`. Run the
+cells in order. The first run downloads the Multi30k German–English data into
+`.data/multi30k`; subsequent runs use the local cache. The notebook uses
+spaCy's built-in German and English tokenizers, so pretrained spaCy models are
+not required.
+
+By default, the translation example runs a small demonstration on either CPU
+or GPU: it trains for one epoch on 64 sentence pairs with a reduced model.
+Its translations illustrate the workflow and are not comparable to the paper's
+results. To use the original larger model and train on the full dataset for
+eight epochs, set the mode before starting Jupyter:
+
+```sh
+ANNOTATED_TRANSFORMER_MODE=full uv run jupyter notebook
+```
+
+Full training requires substantially more time and memory; a CUDA GPU is
+recommended. Checkpoints for different configurations are stored separately.
+To use the CPU even when a GPU is available, start Jupyter with
+`ANNOTATED_TRANSFORMER_DEVICE=cpu uv run jupyter notebook`.
 
 # Notebook Setup
 
@@ -45,7 +79,7 @@ make html
 
 # Formatting and Linting
 
-To keep the code formatting clean, the annotated transformer git repo has a git action to check that the code conforms to [PEP8 coding standards](https://www.python.org/dev/peps/pep-0008/).
+GitHub Actions checks for Python errors and runs the offline workflow tests. The following commands can also be used to check formatting against [PEP 8](https://peps.python.org/pep-0008/).
 
 To make this easier, there are two `Makefile` build targets to run automatic code formatting with black and flake8.
 
@@ -65,4 +99,4 @@ make flake
 
 (or manually call flake8 `flake8 --show-source the_annotated_transformer.py) to check for PEP8 violations.
 
-It's recommended to run these two commands and fix any flake8 errors that arise, when submitting a PR, otherwise the github actions CI will report an error.
+Before submitting a PR, run `uv run python -m unittest discover -s tests -v` to check the training workflow.

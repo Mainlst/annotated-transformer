@@ -1,6 +1,10 @@
 *.ipynb
+!AnnotatedTransformer.ja.ipynb
 .ipynb_checkpoints
 .data
 *.pt
 __pycache__
 wandb
+.venv/
+
+.python-runtime/

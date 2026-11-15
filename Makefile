@@ -36,5 +36,5 @@ move-dataset:
 	mkdir -p ~/.torchtext/cache/IWSLT2016
 	cp 2016-01.tgz ~/.torchtext/cache/IWSLT2016/.
 
-setup: move-dataset
-	pip install -r requirements.txt
+setup:
+	uv sync
